@@ -1,0 +1,14 @@
+# ============================================================
+# Requirements for Civitas UB Detection (ORB) - Jetson
+# ============================================================
+# NOTE: OpenCV pada Jetson sebaiknya di-build dari source dengan
+# CUDA support (sudah tersedia via JetPack SDK).
+# Jangan install opencv-python via pip jika sudah ada OpenCV
+# dari JetPack — akan kehilangan akselerasi GPU.
+# ============================================================
+
+numpy>=1.21.0
+matplotlib>=3.5.0
+
+# Uncomment HANYA jika OpenCV belum terinstall via JetPack:
+# opencv-python>=4.5.0
