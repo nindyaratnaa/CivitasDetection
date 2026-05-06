@@ -1,7 +1,14 @@
-# Multi-Face Civitas Detection System — Architecture
+﻿# Multi-Face Civitas Detection System — Architecture
 
 ## Overview
-Sistem deteksi multi-wajah dengan tracking ringan dan per-person state management untuk Jetson Nano (~20 FPS target).
+Sistem ini dirancang untuk mendeteksi wajah dan menentukan status `Civitas UB` secara real-time pada platform Jetson Nano. Arsitektur ini menggabungkan:
+- multi-face tracking ringan
+- smoothing status per orang
+- deteksi logo UB + warna dada
+- penyesuaian beban komputasi berdasarkan kecerahan frame
+- monitoring performa dan stabilitas
+
+Target performa adalah sekitar 20 FPS pada hardware Jetson Nano.
 
 ---
 
@@ -9,316 +16,239 @@ Sistem deteksi multi-wajah dengan tracking ringan dan per-person state managemen
 
 ```
 JetsonCivitasSystem
-├── FaceTracker              # Lightweight IOU+centroid tracker
-├── PersonStateRegistry      # person_id → CivitasTemporalAveraging
-├── CivitasDetector          # ORB logo + color detection
-└── FPSMonitor               # Performance metrics
+├── FaceTracker
+├── BrightnessAnalyzer
+├── FrameScheduler
+├── CivitasDetector
+├── PersonStateRegistry
+└── FPSMonitor
 ```
 
 ---
 
-## 1. FaceTracker
+## 1. JetsonCivitasSystem
 
-**Purpose:** Assign persistent IDs to detected faces across frames.
+`JetsonCivitasSystem` adalah orchestrator utama. Modul ini menjalankan loop video dan mengkoordinasikan seluruh subkomponen:
 
-**Algorithm:**
-- **Stage 1 — IOU matching:** Match existing tracks to new detections via spatial overlap (IOU ≥ 0.25).
-- **Stage 2 — Centroid fallback:** For unmatched tracks, use centroid distance < 80px.
-- **Track lifecycle:**
-  - `age=1` → new track spawned
-  - `age≥MIN_AGE=2` → confirmed, eligible for rendering
-  - `lost>0` → no detection this frame, coasting on last bbox
-  - `lost>MAX_LOST=6` → pruned from memory
+1. baca frame dari webcam atau file video
+2. flip frame horizontal dan konversi ke grayscale
+3. update kecerahan frame dengan `BrightnessAnalyzer`
+4. deteksi wajah menggunakan Haar Cascade
+5. update `FaceTracker`
+6. sinkronisasikan `PersonStateRegistry`
+7. jalankan `CivitasDetector` untuk setiap track yang visible
+8. beri hasil smoothing status ke overlay UI
+9. bersihkan state dan cache untuk track yang hilang
+10. tampilkan frame dan update statistik FPS
 
-**Key parameters:**
-```python
-MAX_FACES      = 3   # Only track top-3 largest faces
-MAX_LOST       = 6   # Frames before track deletion
-MIN_AGE        = 2   # Frames before track is rendered (anti-flicker)
-IOU_THRESHOLD  = 0.25
-DIST_THRESHOLD = 80  # pixels
-```
+Modul ini juga menangani fallback CUDA/CPU, pengelolaan metric bila diaktifkan, dan laporan performa akhir.
+
+---
+
+## 2. FaceTracker
+
+**Tujuan:** mempertahankan ID yang konsisten untuk setiap wajah yang terdeteksi.
+
+**Strategi utama:**
+- batasi pelacakan ke 3 wajah terbesar saja
+- pencocokan track dilakukan dengan kombinasi:
+  - IOU ≥ 0.15
+  - atau jarak centroid < 500 pixel
+- saat track berdekatan, gunakan histogram HSV sebagai tiebreaker
+- setiap track menyimpan atribut:
+  - `bbox`
+  - `centroid`
+  - `lost`
+  - `age`
+  - histogram `hist`
+
+**Lifecycle:**
+- `age=1` → track baru dibuat
+- `lost==0` → track terlihat
+- jika tidak ada deteksi, `lost += 1`
+- `lost > 15` → track dihapus
 
 **Output:**
-```python
-update(detections) → [(track_id, x, y, w, h), ...]
-# Only returns tracks where lost==0 AND age>=MIN_AGE
-```
+`FaceTracker.update()` mengembalikan track yang visible pada frame saat ini:
+- `lost == 0`
+- `age >= MIN_AGE`
 
 ---
 
-## 2. PersonStateRegistry
+## 3. BrightnessAnalyzer
 
-**Purpose:** Maintain independent `CivitasTemporalAveraging` instance per person.
+**Tujuan:** menentukan kategori kecerahan frame untuk adaptasi beban komputasi.
 
-### Lifecycle States
+`BrightnessAnalyzer` menghitung rata-rata nilai grayscale dan melakukan smoothing dengan Exponential Moving Average. Kategorinya adalah:
+- `Dark` untuk frame gelap
+- `Normal` untuk kondisi umum
+- `Bright` untuk frame terang
 
-| State | Condition | Behavior |
-|-------|-----------|----------|
-| **BORN** | New ID appears in `tracker.tracks` | Allocate fresh averager |
-| **ALIVE** | `lost==0` (visible this frame) | Feed detection → averager |
-| **LOST** | `lost>0` but `lost≤MAX_LOST` | Freeze averager, keep in memory |
-| **DEAD** | ID removed from `tracker.tracks` | Purge averager |
+Kategori ini mempengaruhi:
+- frekuensi eksekusi ORB per track
+- jumlah fitur ORB
+- ukuran ROI ORB
+- frekuensi deteksi kasar
 
-### Key Methods
-
-**`sync(tracker_track_ids: set)`**
-- Call once per frame AFTER `tracker.update()`.
-- Input: `set(face_tracker.tracks.keys())` — **all** live+lost tracks.
-- Allocates averager for new IDs, purges averager for dead IDs.
-- Critical: uses full `tracks` dict, NOT just the confirmed-visible subset, so brief occlusions don't destroy history.
-
-**`feed(person_id, score, is_civitas)`**
-- Push one frame's detection into the person's averager.
-- Only call for tracks where `lost==0` (actively detected this frame).
-
-**`query(person_id) → (status, confidence)`**
-- Return smoothed civitas status for a person.
-- Safe to call even if person is `lost>0` — returns last known state.
-
-**`reset_all()`**
-- Hard-clear all averagers (scene change / long absence).
-- Triggered when `no_face_counter > 40` frames.
-
-### Why This Design?
-
-**Problem with old approach:**
-```python
-# ❌ BAD: cleanup based on tracked (confirmed-visible only)
-active_ids = {tid for tid, *_ in tracked}
-for old_id in list(track_civitas.keys()):
-    if old_id not in active_ids:
-        del track_civitas[old_id]  # ← destroys state too early!
-```
-If a person turns their head for 1 frame → `lost=1` → not in `tracked` → state deleted → smoothing history lost.
-
-**Solution:**
-```python
-# ✅ GOOD: sync based on tracker.tracks (all live tracks)
-self.person_states.sync(set(self.face_tracker.tracks.keys()))
-```
-State survives brief occlusions (up to `MAX_LOST=6` frames), only purged when tracker fully drops the ID.
+Dengan cara ini, sistem mempertahankan kualitas deteksi tanpa berlebihan pada beban GPU/CPU.
 
 ---
 
-## 3. CivitasDetector
+## 4. FrameScheduler
 
-**Purpose:** Detect UB logo + navy/gold colors in chest ROI.
+**Tujuan:** mengatur kapan operasi ORB yang mahal dijalankan untuk setiap track.
 
-**Pipeline:**
-1. Extract chest ROI from face bbox (1.6× width, 2.2× height below face).
-2. **Color detection:** HSV thresholding for navy/gold ratios.
-3. **ORB logo matching:** Multi-scale template matching with homography validation.
-4. **Classification logic:**
-   - Strong logo (conf>0.45) → Civitas UB
-   - Weak logo + navy → Civitas UB
-   - Weak logo + no navy → Non-Civitas UB (false positive suppression)
+`FrameScheduler` menyimpan counter per track. ORB hanya dijalankan ketika counter mencapai ambang yang bergantung pada kategori kecerahan. Saat track hilang, counter tersebut dibersihkan.
 
-**Optimizations:**
-- Blurry-frame cache: reuse last result for up to 6 blurry frames (skip ORB).
-- Reused CLAHE instance (no per-frame allocation).
+Pendekatan ini menjaga kestabilan performa dengan menyesuaikan penggunaan ORB pada tiap target.
 
 ---
 
-## 4. CivitasTemporalAveraging
+## 5. CivitasDetector
 
-**Purpose:** Smooth noisy per-frame predictions over time.
+**Tujuan:** menentukan apakah satu track adalah `Civitas UB`.
 
-**Algorithm:**
-- Exponential recency weighting: recent frames matter more.
-- Hysteresis: state must hold for `STATE_HOLD_FRAMES=10` before switching.
-- Thresholds:
-  - `w_status ≥ 0.55` AND `w_score ≥ 0.65` → Civitas UB
-  - `w_status ≤ 0.32` AND `w_score < 0.65` → Non-Civitas UB
-  - Otherwise → Uncertain
+**Pipeline deteksi:**
+1. ekstrak chest ROI dari face bounding box
+2. konversi ROI ke grayscale dan HSV
+3. hitung rasio warna untuk `navy`, `dark_navy`, `light_navy`, `gold`
+4. jalankan ORB logo matching pada chest ROI
+5. cocokkan dengan template UB pada beberapa skala
+6. filter keypoint menurut area dada yang diharapkan
+7. hitung skor final dan tentukan status
 
-**Buffer size:** 20 frames (~1 second at 20 FPS).
+**Fitur utama:**
+- dukungan ORB CUDA jika tersedia
+- fallback ke ORB CPU bila CUDA tidak tersedia
+- CuPy opsional untuk perhitungan mask warna HSV
+- cache hasil per track agar framebuffer berikutnya dapat menggunakan hasil sebelumnya saat ORB tidak dijalankan
+- CLAHE dan sharpening reuse untuk stabilitas deteksi
+
+**Keluaran:**
+- status (`Civitas UB` / `Non-Civitas UB`)
+- confidence score
+- chest box
+- logo box
 
 ---
 
-## Main Loop Flow
+## 6. PersonStateRegistry
+
+**Tujuan:** menyimpan history dan melakukan smoothing status per person ID.
+
+`PersonStateRegistry` membuat satu instance `CivitasTemporalAveraging` untuk setiap `track_id`. Ia menggunakan `sync()` untuk:
+- menambahkan ID baru saat muncul
+- menghapus ID yang sudah mati
+
+`feed()` hanya dipanggil untuk track yang benar-benar terlihat. `query()` dapat mengembalikan status terakhir bahkan bila track sedang hilang sesaat. `reset_all()` membersihkan semua riwayat saat tidak ada wajah dalam durasi panjang.
+
+Sinkronisasi berdasarkan `tracker.tracks` menjaga history ketika track mengalami occlusion singkat.
+
+---
+
+## 7. CivitasTemporalAveraging
+
+**Tujuan:** meredam noise per-frame untuk menghasilkan status yang lebih stabil.
+
+**Implementasi utama:**
+- buffer hingga 30 frame
+- bobot eksponensial untuk menekankan frame terbaru
+- threshold confidence default 0.60
+- status akhir menjadi:
+  - `Civitas UB`
+  - `Non-Civitas UB`
+  - `Uncertain`
+
+**Logika transisi:**
+- `Civitas UB` bila `w_status >= 0.50` dan `w_score >= 0.60`
+- `Non-Civitas UB` bila `w_status <= 0.35` dan `w_score < 0.60`
+- selain itu, status menjadi `Uncertain`
+
+Status hanya berganti setelah kondisi konsisten selama beberapa frame untuk menghindari fluktuasi cepat.
+
+---
+
+## 8. Main Loop Flow
 
 ```python
 while True:
-    # 1. Detect faces (Haar cascade)
-    raw_faces = face_cascade.detectMultiScale(gray, 1.1, 8, minSize=(80,80))
-    
-    # 2. Update tracker → get confirmed-visible tracks
-    tracked = face_tracker.update(raw_faces)  # [(id,x,y,w,h), ...]
-    
-    # 3. Sync state registry with ALL tracker IDs (live+lost)
+    frame = capture_frame()
+    frame = flip(frame)
+    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    brightness.update(gray)
+
+    raw_faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(40,40))
+    detections = [tuple(f) for f in raw_faces]
+
+    tracked = face_tracker.update(detections)
+
     person_states.sync(set(face_tracker.tracks.keys()))
-    
-    # 4. Process each confirmed-visible track
-    for (tid, x, y, w, h) in tracked:
-        inst_status, inst_conf, _, _ = civitas_detector.detect_civitas_status(frame, x,y,w,h)
-        person_states.feed(tid, inst_conf, inst_status == "Civitas UB")
-        smooth_status, smooth_conf = person_states.query(tid)
-        draw_face(frame, tid, x, y, w, h, ...)
-    
-    # 5. Handle no-face scenario
-    if not tracked:
+
+    if tracked:
+        no_face_counter = 0
+        for tid, x, y, w, h in tracked:
+            inst_status, inst_conf, civitas_box, logo_box = civitas_detector.detect_civitas_status(
+                frame, tid, x, y, w, h,
+                scheduler, brightness
+            )
+            person_states.feed(tid, inst_conf, inst_status == "Civitas UB")
+            smooth_status, smooth_conf = person_states.query(tid)
+            draw_face(...)
+    else:
         no_face_counter += 1
         if no_face_counter > 40:
             person_states.reset_all()
+
+    cleanup_lost_tracks()
+    draw_fps_panel(frame)
+    show_frame(frame)
 ```
 
 ---
 
-## Key Design Decisions
+## 9. Design Rationale
 
-### 1. Why sync with `tracker.tracks` instead of `tracked`?
-
-`tracked` = only confirmed-visible tracks (`lost==0` AND `age≥MIN_AGE`).  
-`tracker.tracks` = all live tracks including those temporarily lost.
-
-If we sync with `tracked`, a person who blinks or turns away for 1 frame loses their entire smoothing history. Syncing with `tracker.tracks` preserves state during brief occlusions.
-
-### 2. Why `MAX_LOST=6` instead of 15?
-
-Lower `MAX_LOST` = faster cleanup of ghost tracks (false positives that disappear).  
-6 frames (~0.3s at 20 FPS) is enough to handle brief occlusions but not long enough to create persistent "ghost" bboxes.
-
-### 3. Why `MIN_AGE=2`?
-
-Haar cascade produces occasional 1-frame false positives. Requiring a track to survive 2 consecutive frames before rendering eliminates most flicker.
-
-### 4. Why `minNeighbors=8` instead of 5?
-
-Higher `minNeighbors` = stricter Haar cascade, fewer false positives from shadows/textures. Trade-off: slightly lower recall on difficult angles.
+- `FaceTracker` memprioritaskan konsistensi ID dengan kombinasi IOU, jarak centroid, dan appearance.
+- `MAX_LOST = 15` memberi toleransi occlusion sementara sebelum track dihapus.
+- `MIN_AGE = 1` memungkinkan track segera tampil karena false positive dikendalikan di lapisan lain.
+- `tracker.tracks` adalah sumber kebenaran untuk `PersonStateRegistry`, sehingga riwayat tidak hilang saat track sementara lost.
+- `BrightnessAnalyzer` dan `FrameScheduler` menjaga keseimbangan antara deteksi yang andal dan efisiensi komputasi.
+- `CivitasDetector` menggabungkan deteksi logo dan deteksi warna agar false positive lebih rendah.
 
 ---
 
-## Performance Characteristics
-
-**Target:** 20 FPS on Jetson Nano  
-**Bottleneck:** ORB feature matching (3× per frame for 3 faces)
-
-**Optimizations applied:**
-- Top-3 face limit (no wasted ORB on background faces)
-- Blurry-frame cache (skip ORB on motion blur)
-- Reused CLAHE/sharpen kernels
-- `minSize=(80,80)` on Haar cascade (ignore tiny faces)
-
-**Expected FPS:**
-- 1 face: 22-25 FPS
-- 2 faces: 18-22 FPS
-- 3 faces: 15-20 FPS
-
----
-
-## State Diagram
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    PersonStateRegistry                      │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    ┌──────────────────┐
-                    │   ID not seen    │
-                    │   (no state)     │
-                    └──────────────────┘
-                              │
-                              │ sync() sees new ID
-                              ▼
-                    ┌──────────────────┐
-                    │   BORN (age=1)   │
-                    │  allocate avg    │
-                    └──────────────────┘
-                              │
-                              │ age≥MIN_AGE
-                              ▼
-                    ┌──────────────────┐
-                    │  ALIVE (lost=0)  │◄──┐
-                    │  feed() updates  │   │
-                    └──────────────────┘   │
-                              │            │
-                              │ no detect  │ detect again
-                              ▼            │
-                    ┌──────────────────┐   │
-                    │  LOST (lost>0)   │───┘
-                    │  state frozen    │
-                    └──────────────────┘
-                              │
-                              │ lost>MAX_LOST
-                              ▼
-                    ┌──────────────────┐
-                    │  DEAD (pruned)   │
-                    │  sync() purges   │
-                    └──────────────────┘
-```
-
----
-
-## Extending the System
-
-### Add new per-person attributes
-```python
-class PersonStateRegistry:
-    def __init__(self):
-        self._states = {}
-        self._metadata = {}  # NEW: track extra info per person
-    
-    def set_metadata(self, person_id, key, value):
-        if person_id not in self._metadata:
-            self._metadata[person_id] = {}
-        self._metadata[person_id][key] = value
-```
-
-### Add face recognition
-```python
-# In main loop after civitas detection:
-face_embedding = face_recognizer.extract(face_roi)
-person_states.set_metadata(tid, 'embedding', face_embedding)
-```
-
-### Add pose estimation
-```python
-pose = pose_estimator.detect(frame, x, y, w, h)
-person_states.set_metadata(tid, 'pose', pose)
-```
-
----
-
-## Troubleshooting
-
-**Problem:** Bbox flickers on/off rapidly.  
-**Solution:** Increase `MIN_AGE` to 3-4 frames.
-
-**Problem:** State lost during brief occlusions.  
-**Solution:** Increase `MAX_LOST` to 10-12 frames.
-
-**Problem:** Ghost bboxes persist after person leaves.  
-**Solution:** Decrease `MAX_LOST` to 4-5 frames.
-
-**Problem:** Too many false positives.  
-**Solution:** Increase `minNeighbors` to 10-12 in Haar cascade.
-
-**Problem:** FPS drops below 15.  
-**Solution:** Reduce `MAX_FACES` to 2, or increase `minSize` to (100,100).
-
----
-
-## File Structure
+## 10. File Structure
 
 ```
 Detection/
-├── orv-rev3.py              # Main system
-├── ARCHITECTURE.md          # This file
+├── civitas_detection.py
+├── civitas_detection_cuda.py
+├── metrics_graph.py
+├── requirements.txt
+├── docs/
+│   ├── 01-architecture.md
+│   ├── 02-face-tracker.md
+│   ├── 03-logo-detection.md
+│   ├── 04-color-detection.md
+│   ├── 05-brightness-analyzer.md
+│   ├── 06-temporal-averaging.md
+│   ├── 07-civitas-detector.md
+│   └── 08-deployment-jetson.md
 ├── haarcascades/
 │   └── haarcascade_frontalface_default.xml
+├── metrics/
+├── src/
+│   ├── 1.mp4
+│   └── 2.mp4
 ├── templates/
 │   ├── ub_logo_colored.png
 │   └── ub_logo_bw.png
-└── src/
-    ├── 1.mp4                # Test videos
-    └── 2.mp4
+└── unused/
 ```
 
 ---
 
-## Usage
+## 11. Usage
 
 ```bash
 # Webcam
@@ -334,13 +264,106 @@ Press 'q'
 
 ---
 
-## Performance Metrics
+## 12. Performance Metrics
 
-System tracks and displays:
-- Current/Avg/Min/Max FPS
+Aplikasi menampilkan dan merekam:
+- Current / Average / Min / Max FPS
 - Frame time (ms)
 - Stability score (0-100%)
 - Active tracks vs states
 - Runtime
 
-Final statistics printed on exit.
+Statistik akhir ditampilkan saat aplikasi berhenti.
+
+---
+
+## 13. Data Flow Illustration
+
+Berikut adalah ilustrasi alur data dari input hingga output dalam sistem `civitas_detection_cuda.py`. Diagram ini menunjukkan bagaimana data mengalir melalui komponen utama dalam satu iterasi loop utama.
+
+```
+Input Frame (Webcam/Video)
+    |
+    v
+Flip Frame Horizontal
+    |
+    v
+Konversi ke Grayscale
+    |
+    v
+Update BrightnessAnalyzer
+    |
+    v
+Deteksi Wajah (Haar Cascade)
+    |
+    v
+Update FaceTracker
+    |
+    v
+Sync PersonStateRegistry
+    |
+    +---------------------+
+    | Ada track visible?  |
+    +---------------------+
+          | Ya
+          v
+    Loop untuk setiap track:
+    - Jalankan CivitasDetector
+    - Feed ke PersonStateRegistry
+    - Query status smoothed
+    - Draw Face dengan status
+          |
+          v
+    Cleanup track hilang
+          |
+          v
+    Draw FPS Panel & Display Frame
+          |
+          v
+    Loop kembali ke Input
+          | Tidak
+          v
+    Increment no_face_counter
+    |
+    +---------------------+
+    | no_face_counter > 40? |
+    +---------------------+
+          | Ya
+          v
+    Reset PersonStateRegistry
+          |
+          v
+    Cleanup track hilang
+          | Tidak
+          v
+    Cleanup track hilang
+```
+
+### Penjelasan Alur Data:
+
+1. **Input Frame**: Sistem menerima frame BGR dari webcam atau file video.
+
+2. **Preprocessing**: Frame di-flip horizontal (untuk mirror effect) dan dikonversi ke grayscale untuk deteksi wajah.
+
+3. **Brightness Analysis**: `BrightnessAnalyzer` menghitung kategori kecerahan (Dark/Normal/Bright) untuk mengatur beban komputasi ORB.
+
+4. **Face Detection**: Haar Cascade mendeteksi wajah pada grayscale frame, menghasilkan list bounding box.
+
+5. **Tracking**: `FaceTracker` mempertahankan ID konsisten untuk wajah, menggunakan IOU, centroid distance, dan histogram appearance sebagai tiebreaker.
+
+6. **State Synchronization**: `PersonStateRegistry` disinkronkan dengan semua track (live + lost) untuk menjaga history smoothing.
+
+7. **Per-Track Processing** (jika ada track visible):
+   - `CivitasDetector` mengekstrak chest ROI, mendeteksi warna navy/gold, dan menjalankan ORB logo matching.
+   - Hasil per-frame di-feed ke `CivitasTemporalAveraging` untuk smoothing.
+   - Status smoothed di-query dan digunakan untuk rendering overlay.
+
+8. **No-Face Handling**: Jika tidak ada wajah, counter diincrement. Jika counter > 40 frame, semua state di-reset.
+
+9. **Cleanup**: Track yang hilang dihapus dari scheduler dan detector cache.
+
+10. **Output Rendering**: FPS panel dan face overlays ditambahkan ke frame, lalu frame ditampilkan.
+
+11. **Loop**: Proses berulang untuk frame berikutnya.
+
+Diagram ini menunjukkan bagaimana data mengalir secara sequential, dengan branching untuk kondisi presence/absence wajah, dan parallel processing per track.
